@@ -50,8 +50,12 @@ User/Feishu → OpenClaw Gateway (0.0.0.0:18789)
 
 - App ID: `cli_a9690bef46389cd4`
 - Plugin: `@openclaw/feishu` (installed at `~/.openclaw/npm/node_modules/@openclaw/feishu/`)
-- WebSocket long-connection for event receiving
+- WebSocket long-connection for event receiving (connectionMode: websocket)
 - Features: feishu_chat, feishu_doc, feishu_drive, feishu_perm, feishu_wiki, feishu_bitable
+- **requireMention: false** — 群聊无需@机器人即可触发回复 (v0.2.0 起)
+- **dmPolicy: open** — 任何人私聊都会回复，无需pairing确认 (v0.2.0 起)
+- **groupPolicy: open** — 群聊开放，任何成员消息都会触发
+- Auth token: `opclaw123` — Gateway 简单认证
 
 ### Docker Infrastructure
 

@@ -1,5 +1,65 @@
 # CHANGELOG
 
+## v0.2.0 (2026-06-11) — Fix OpenClaw Control UI & Feishu Group Chat Auto-Reply
+
+### 概述
+修复 OpenClaw Control UI 可访问性确认、飞书群聊免@自动回复、DM策略改为open方便操作、清理无效session。
+
+### 详细变更
+
+#### 1. 飞书群聊免@自动回复 (requireMention: true → false)
+- **之前**: `channels.feishu.requireMention = true` — 群聊中必须@机器人才能触发回复
+- **之后**: `channels.feishu.requireMention = false` — 群聊中任何消息都会触发机器人回复
+- 目的：方便群聊使用，不需要每次@机器人
+- ⚠️ 注意：机器人会对群聊中所有消息回复，可能较活跃。如需改为只回复@消息，设置 `requireMention: true`
+- 修改方式: `openclaw config set channels.feishu.requireMention false`
+
+#### 2. 飞书DM策略改为open (dmPolicy: pairing → open)
+- **之前**: `channels.feishu.dmPolicy = "pairing"` — 需要pairing确认才能私聊
+- **之后**: `channels.feishu.dmPolicy = "open"` — 任何人私聊机器人都会回复
+- 目的：方便操作，不需要额外确认步骤
+- 修改方式: `openclaw config set channels.feishu.dmPolicy open`
+
+#### 3. Control UI 可访问性确认
+- Gateway 绑定 `0.0.0.0:18789`，从 localhost (127.0.0.1) 和 LAN IP (192.168.1.107) 都能 HTTP 200 正常访问
+- `controlUi.dangerouslyDisableDeviceAuth = true` — 禁用设备认证，方便从不同设备访问
+- `controlUi.allowInsecureAuth = true` — 允许不安全认证，方便快速访问
+- `controlUi.allowedOrigins = ["*"]` — 允许任何来源访问
+- Auth token: `opclaw123` — 简单的认证token，方便记忆和输入
+- 结论：Control UI 当前配置已满足方便操作的需求，无需额外修改
+
+#### 4. Session 清理
+- 清理了 1 个缺失 transcript 的 session（从 5 → 4）
+- 命令: `openclaw sessions cleanup --enforce --fix-missing`
+
+#### 5. Gateway 重启
+- 修改 feishu 配置后重启 gateway 使配置生效
+- 新 pid: 2224428, 状态 active
+- 验证：openclaw status 显示所有组件正常，Feishu Channel ON/OK
+
+### 当前状态
+- OpenClaw Gateway: running (pid 2224428, 0.0.0.0:18789)
+- Feishu Channel: ON/OK (WebSocket connected)
+- Model: proxy40002/dsv4p (anthropic-messages API)
+- Feishu: requireMention=false, dmPolicy=open, groupPolicy=open
+
+### 验证方式
+```bash
+# 检查 feishu requireMention 配置
+openclaw config get channels.feishu.requireMention  # 应输出 false
+
+# 检查 Control UI
+curl -s http://192.168.1.107:18789/ -o /dev/null -w "%{http_code}"  # 应输出 200
+
+# 测试飞书消息发送（在飞书群聊中发消息，不用@机器人，观察是否自动回复）
+```
+
+### 下一步优化方向
+- 在飞书群中实际测试免@回复是否生效
+- 监控群聊免@后的回复频率和质量
+- 优化 LiteLLM routing strategy
+- 探索 OpenClaw 升级到 2026.6.5
+
 ## v0.1.0 (2026-06-05) — Initial Setup & Configuration
 
 ### 概述
