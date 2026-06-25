@@ -1,5 +1,94 @@
 # CHANGELOG
 
+## v0.3.0 (2026-06-25) — 远程模型链路改为主备: openclaw → 40003 → 41001(默认) + 41002(兜底)，仅用 ModelScope GLM-5.2
+
+### 概述
+远程主机 `opc2sname-tailscale` (用户 opc2_uname) 的 openclaw 模型链路从「单 LiteLLM」改为「主备双 LiteLLM」：
+- **openclaw → 40003 (passthrough-proxy) → 41001 (默认) → 41001 全 key 耗尽时兜底到 41002**
+- 41002 = 41001 的 config copy（独立目录/容器/DB），作为「旧版本兜底」——后续持续优化 41001 时不影响 41002
+- 上下游**只用 ModelScope GLM-5.2**（不走 NV）
+- **仅改远程部署，本地仓库不动部署逻辑**
+
+### 背景
+- 远程 `ms_uni41001` 的 config.yaml 已先期改为 GLM-5.2（70 dep，case-permutation variant × 7 keys），这是「相关代码已改」的部分
+- passthrough-proxy (40003) 历史上 (R29 之前) 曾有 `ms_uni41002` 兜底，R29 移除了；本版本针对 GLM-5.2 重新恢复并明确主备语义
+
+### 详细变更（均在远程 `/opt/cc-infra`）
+
+#### 1. 新建 41002 独立 config 目录
+- `mkdir -p /opt/cc-infra/litellm-glm51-fb` + `logs/litellm-glm51-fb`
+- `cp litellm-glm51/config.yaml litellm-glm51-fb/config.yaml`（与 41001 完全一致，GLM-5.2，70 dep）
+- 头注释改为标明 41002 fallback 身份：`# 41002 LiteLLM Config — glm5.2 (70 dep), rpm=1 [FALLBACK copy of 41001, R46]`
+- 设计意图：41002 文件独立，后续优化 41001 的 config 时此兜底版本保持不动
+
+#### 2. docker-compose.yml: 新增 `ms_uni41002` 服务
+- 复制 `ms_uni41001` 块，改动：
+  - `container_name: ms_uni41002`，`ports: 41002:4000`
+  - `DATABASE_URL` → 独立 DB `litellm_glm51_fallback`（复用历史遗留的空 DB，与 41001 router state 隔离）
+  - volumes: `./litellm-glm51-fb/config.yaml` + `./logs/litellm-glm51-fb`
+  - env (MS_KEY1-7 / MS_BASEURL / LITELLM_MASTER_KEY) 与 41001 一致
+  - `depends_on: cc_postgres (service_healthy)`
+- 备份: `docker-compose.yml.bak.R46-<ts>`
+
+#### 3. passthrough-proxy config.py: 新增 fallback 环境变量
+- `LITELLM_URL_GLM51_FB` / `LITELLM_MODELS_URL_GLM51_FB` / `LITELLM_FB_ENABLED`
+- 空字符串 → 禁用（向后兼容其他 proxy role / 其他部署，已用 docker import 测试验证）
+- 关键修正：`_ensure_url_path("")` 会返回 `/v1/chat/completions`（非空）导致误启用，故用 `LITELLM_FB_RAW = env.strip()` 先判空再 `_ensure_url_path`
+
+#### 4. passthrough-proxy upstream.py: 插入 41002 兜底逻辑
+- import 新增 `LITELLM_URL_GLM51_FB, LITELLM_FB_ENABLED`
+- 在 MS primary `_try_ms_keys` 全部失败后、NV 不可用的 `return result` 之前插入：
+  ```
+  if LITELLM_FB_ENABLED and result.all_keys_exhausted:
+      _log("MS-FB-FALLTHROUGH", "All 41001 MS keys exhausted → trying 41002 fallback")
+      result = _try_ms_keys(..., LITELLM_URL_GLM51_FB, litellm_model_base)
+      ...
+      return result
+  ```
+- 复用现有 `_try_ms_keys`（其 `litellm_url` 参数控制上游），41002 config 与 41001 model_name 一致（`glm5.1v{V}k{K}`），可直接复用
+- 更新文件头 R29 注释为「R46: Restored 41002 fallback (GLM-5.2 copy of 41001)」
+- 备份: `config.py.bak.R46-<ts>` / `upstream.py.bak.R46-<ts>`
+
+#### 5. docker-compose.yml: 给 40003 加 fallback env + depends_on
+- `LITELLM_URL_GLM51_FB: http://ms_uni41002:4000/v1/chat/completions`
+- `LITELLM_MODELS_URL_GLM51_FB: http://ms_uni41002:4000/v1/models`
+- `depends_on` 追加 `ms_uni41002`
+
+### 兜底触发语义（已与用户确认）
+- **全 key 耗尽才兜底**：41001 内部 v×k 轮转 + 429/conn-error cycling 把 7 个 key 全部试完后，才切到 41002 再跑一轮
+- 41001 与 41002 共用同一组 ModelScope key+variant → **配额共享**，兜底主要价值是「41001 容器/配置故障或全部 429 时保活」，不是额外配额
+- 已知权衡：41001 容器整体宕机时，需走完 7 key × ~7-8s 超时 ≈ 54s 才切到 41002（既有 cycling 设计；后续可优化为「连接 refused 快速判定容器死」）
+
+### 部署
+```bash
+cd /opt/cc-infra
+docker compose up -d ms_uni41002          # 新建并启动 41002
+docker compose up -d --build auth_to_api_40003  # 重建 40003（代码改了）
+```
+
+### 测试验证（全部通过）
+1. **41002 独立健康**：`/health/liveliness` 200；`/v1/models` 返回 70 个 model
+2. **41002 直连推理**：`curl 41002/v1/chat/completions -d '{"model":"glm5.1v1k1",...,"stream":true}'` 流式返回 GLM-5.2 内容 ✓
+3. **40003 正常路径**（走 41001）：`curl 40003 -d '{"model":"glm5.1_ol",...}'` 流式返回，日志显示 `glm5.1v5k5`（41001）✓
+4. **40003 兜底路径**（模拟 41001 故障）：`docker stop ms_uni41001` → 请求 40003 → 日志出现 `[MS-FB-FALLTHROUGH] All 41001 MS keys exhausted → trying 41002 fallback` → 从 41002 (`glm5.1v5k6`) 成功返回 ✓；之后 `docker start ms_uni41001` 恢复
+5. **openclaw 端到端**：`openclaw agent --agent main --message "..."` 回复「我现在能正常工作，当前运行的模型是 proxy-gateway/glm5.1_ol」✓
+6. **openclaw status --deep**：Gateway reachable 196ms，飞书 Channel ON/OK ✓
+
+### 当前状态
+- 三个容器均 healthy：`ms_uni41001` (41001, 默认) / `ms_uni41002` (41002, 兜底) / `auth_to_api_40003` (40003, passthrough)
+- openclaw: `providers.proxy-gateway.baseUrl=http://127.0.0.1:40003/v1`，model id `glm5.1_ol` → 40003 → 41001 → ModelScope GLM-5.2
+- 链路：openclaw → 40003 → 41001(默认) + 41002(全 key 耗尽兜底)
+
+### 回滚
+- compose: `cp docker-compose.yml.bak.R46-<ts> docker-compose.yml && docker compose up -d`
+- 代码: `cp proxy/passthrough-proxy/gateway/{config,upstream}.py.bak.R46-<ts> ...` 后 `docker compose up -d --build auth_to_api_40003`
+- 41002 服务: `docker compose stop ms_uni41002`（保留容器/config 以便再启用）
+
+### 下一步优化方向
+- 41001 容器整体宕机时快速判定（连接 refused → 立即切 41002，不逐 key 超时）
+- 持续优化 41001 的 config（variant/key 调度、rpm），41002 作为稳定兜底不动
+- 监控 41002 实际被触发的频率（应接近 0，仅在 41001 故障时）
+
 ## v0.2.0 (2026-06-11) — Fix OpenClaw Control UI & Feishu Group Chat Auto-Reply
 
 ### 概述

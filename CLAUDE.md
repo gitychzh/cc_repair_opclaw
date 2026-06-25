@@ -8,28 +8,29 @@ cc_repair_opclaw — 长期优化 OpenClaw 龙虾机器人。每轮优化完成�
 
 ## Architecture Overview
 
-### Full Chain: OpenClaw → Proxy → LiteLLM → ModelScope
+### Full Chain: OpenClaw → Proxy → LiteLLM → ModelScope (v0.3.0, 远程 opc2sname)
 
 ```
 User/Feishu → OpenClaw Gateway (0.0.0.0:18789)
-    → Anthropic API → proxy40002 (127.0.0.1:40002, format conversion)
-        → OpenAI API → dsv4p_uni42001 LiteLLM (127.0.0.1:42001, routing/fallback/retry)
-            → ModelScope API (dsv4p, 11 variants × 7 keys = 77 deployments)
-        → OpenAI API → glm5.1_test41003 LiteLLM (127.0.0.1:41003, routing/fallback/retry)
-            → ModelScope API (glm5.1, 1000 variants × 7 keys = 7000 deployments)
+    → OpenAI API → proxy40003 (127.0.0.1:40003, passthrough-proxy, OpenAI format)
+        → OpenAI API → ms_uni41001 LiteLLM (127.0.0.1:41001, 默认, v×k round-robin)
+            → ModelScope API (GLM-5.2, 10 variants × 7 keys = 70 deployments)
+        [41001 全 key 耗尽时兜底]
+        → OpenAI API → ms_uni41002 LiteLLM (127.0.0.1:41002, fallback, config=41001 copy)
+            → ModelScope API (GLM-5.2, 同一组 70 deployments, 独立容器/DB)
 ```
 
-### Key Components
+### Key Components (远程 opc2sname 实际部署)
 
 | Component | Port | Role |
 |-----------|------|------|
 | OpenClaw Gateway | 18789 | AI agent platform, Feishu integration, Control UI |
-| proxy40002 (auth_to_api_40002) | 40002 | Anthropic ↔ OpenAI format conversion, metrics logging, input safety |
-| proxy40001 (auth_to_api_40001) | 40001 | Same proxy, port 40001 (for Claude Code) |
-| dsv4p_uni42001 (LiteLLM) | 42001 | DeepSeek V4 Pro routing, 77 deployments |
-| glm5.1_uni41001 (LiteLLM) | 41001 | GLM-5.1 routing, 1792 deployments (legacy, not primary routing) |
-| glm5.1_test41003 (LiteLLM) | 41003 | GLM-5.1 test routing, 7000 deployments (primary glm5.1 routing) |
-| cc_postgres | 5432 | LiteLLM persistence DB (3 DBs: litellm_glm51, litellm_dsv4p, litellm_glm51_test) |
+| proxy40003 (auth_to_api_40003) | 40003 | Passthrough proxy, OpenAI format, v×k cycling + 41001→41002 兜底 |
+| ms_uni41001 (LiteLLM) | 41001 | **默认** GLM-5.2 routing, 70 deployments, config `litellm-glm51/config.yaml` |
+| ms_uni41002 (LiteLLM) | 41002 | **兜底** GLM-5.2 routing, 70 deployments, config `litellm-glm51-fb/config.yaml` (41001 copy, 独立 DB) |
+| cc_postgres | 5432 | LiteLLM persistence DB (litellm_glm51 for 41001, litellm_glm51_fallback for 41002) |
+
+> 注：本地仓库 CLAUDE.md 早期记录的 dsv4p/glm5.1_test41003 等组件是历史版本，已被远程实际部署取代。当前真实链路见上图。
 
 ### OpenClaw Configuration
 
