@@ -8,29 +8,35 @@ cc_repair_opclaw — 长期优化 OpenClaw 龙虾机器人。每轮优化完成�
 
 ## Architecture Overview
 
-### Full Chain: OpenClaw → Proxy → LiteLLM → ModelScope (v0.3.0, 远程 opc2sname)
+### Full Chain: OpenClaw → passthrough-proxy → ms-gateway → ModelScope (v0.4.0, 本机)
 
 ```
-User/Feishu → OpenClaw Gateway (0.0.0.0:18789)
-    → OpenAI API → proxy40003 (127.0.0.1:40003, passthrough-proxy, OpenAI format)
-        → OpenAI API → ms_uni41001 LiteLLM (127.0.0.1:41001, 默认, v×k round-robin)
-            → ModelScope API (GLM-5.2, 10 variants × 7 keys = 70 deployments)
-        [41001 全 key 耗尽时兜底]
-        → OpenAI API → ms_uni41002 LiteLLM (127.0.0.1:41002, fallback, config=41001 copy)
-            → ModelScope API (GLM-5.2, 同一组 70 deployments, 独立容器/DB)
+User/Feishu → OpenClaw Gateway (0.0.0.0:18789, api: openai-completions, model glm5.1_ol)
+    → /v1/chat/completions → proxy40003 (127.0.0.1:40003, passthrough-proxy, OpenAI format)
+        [非流式请求强制 stream=true 上游, 流式收集后合成非流式 OpenAI 响应 — v0.4.0]
+        [v×k 2D round-robin + burst 429 per-(variant,key) 冷却 + 全局出站节流 1.8s]
+        → /v1/chat/completions → ms_uni41001 (127.0.0.1:41001, ms-gateway, 纯 Python 直连)
+            → https://api-inference.modelscope.cn/v1/chat/completions (GLM-5.2, 10 variants × 7 keys = 70 deployments)
 ```
 
-### Key Components (远程 opc2sname 实际部署)
+> v0.4.0 修正：`ms_uni41001` 已不是 LiteLLM，是 ~50MB 的 Python 直连 ModelScope 网关（`/opt/cc-infra/proxy/ms-gateway`），不依赖 DB。CLAUDE.md 早期版本里"41001→41002 双 LiteLLM 兜底"在本机部署中不存在（41002 容器未起）。GLM-5.2 与 GLM-5.1 在 ModelScope 均可用，链路实际打的是 GLM-5.2；模型名 `glm5.1_*` 仅为历史命名遗留。passthrough config 里 `glm5.2→glm5.1` 的"ModelScope dropped GLM-5.2"注释为过时错误信息。
+
+### Key Components (本机实际部署)
 
 | Component | Port | Role |
 |-----------|------|------|
 | OpenClaw Gateway | 18789 | AI agent platform, Feishu integration, Control UI |
-| proxy40003 (auth_to_api_40003) | 40003 | Passthrough proxy, OpenAI format, v×k cycling + 41001→41002 兜底 |
-| ms_uni41001 (LiteLLM) | 41001 | **默认** GLM-5.2 routing, 70 deployments, config `litellm-glm51/config.yaml` |
-| ms_uni41002 (LiteLLM) | 41002 | **兜底** GLM-5.2 routing, 70 deployments, config `litellm-glm51-fb/config.yaml` (41001 copy, 独立 DB) |
-| cc_postgres | 5432 | LiteLLM persistence DB (litellm_glm51 for 41001, litellm_glm51_fallback for 41002) |
+| proxy40003 (auth_to_api_40003) | 40003 | **openclaw 主入口** passthrough proxy, OpenAI format, v×k cycling + burst 429 冷却 + 强制流式 |
+| ms_uni41001 (ms-gateway) | 41001 | 纯 Python 直连 ModelScope, 70 deployments (GLM-5.2), 无路由/无重试/无 DB |
+| cc_postgres | 5432 | LiteLLM 历史 DB (ms-gateway 不使用) |
 
-> 注：本地仓库 CLAUDE.md 早期记录的 dsv4p/glm5.1_test41003 等组件是历史版本，已被远程实际部署取代。当前真实链路见上图。
+> 其它容器（40001 cc-proxy / 40002 codex / 40005 cc-experiment / 40000 dispatcher / 40006 hm-proxy / 41101-41105 LiteLLM）为历史/备用链路，v0.4.0 未改动、未启用在 openclaw 主链路中。
+
+### ModelScope 限速（实测）
+- `Model-Requests-Limit: 200`（每 variant/天，独立配额）
+- `Requests-Limit: 2000`（账户级/天总配额）
+- 突发 429：`"Request rate increased too quickly"` — 短时并发限速，与日配额无关，是 429 主因
+- 治理：全局出站节流 `MIN_OUTBOUND_INTERVAL_S` + per-(variant,key) `BURST_COOLDOWN_S` + v×k 轮询绕开冷却 slot
 
 ### OpenClaw Configuration
 
@@ -38,14 +44,18 @@ User/Feishu → OpenClaw Gateway (0.0.0.0:18789)
 - Agent models: `~/.openclaw/agents/main/agent/models.json`
 - Workspace: `~/.openclaw/workspace/`
 - Gateway systemd service: `~/.config/systemd/user/openclaw-gateway.service`
+- Models provider: `litellm`, `api: openai-completions`, `baseUrl: http://127.0.0.1:40003/v1`, model id `glm5.1_ol` (contextWindow 170000)
 
-### Proxy (proxy.py) Key Features
+### Proxy (passthrough-proxy, 40003) Key Features
 
-1. **Anthropic ↔ OpenAI format conversion** — converts `/v1/messages` (Anthropic) to `/v1/chat/completions` (OpenAI)
-2. **Force-stream fix** — all non-stream requests forced to `stream=true` upstream (ModelScope non-stream returns invalid `delta` field)
-3. **Model name mapping** — Claude model names (claude-opus-4-8, etc.) mapped to glm5.1/dsv4p
-4. **Tool description truncation** — MAX_TOOL_DESC=2000 chars, MAX_SCHEMA_DESC=600 chars
-5. **Input token safety** — estimates tokens from text content, rejects if over model limit
+1. **OpenAI passthrough** — 只服务 `/v1/chat/completions`（openclaw 直连，无 Anthropic 转换）
+2. **Force-stream fix (v0.4.0 扩展到 OpenAI 路径)** — 非流式请求强制 `stream=true` 上游，`collect_stream_to_openai` 收集 SSE 后合成非流式 OpenAI 响应（ModelScope 非流式返回 `choices:null` 空响应）
+3. **v×k 2D round-robin** — request N → variant_idx=(N//NUM_KEYS)%NUM_VARIANTS, key_idx=N%NUM_KEYS；429 时同 variant 内 key 循环；counter 持久化到 `rr_counter.json` 防重启回 v1k1
+4. **Burst 429 冷却 (v0.4.0)** — burst 429 标记 (variant,key) 冷却 8s，轮询自动绕开；quota 耗尽不冷却
+5. **Outbound throttle** — `MIN_OUTBOUND_INTERVAL_S=1.8` 全局出站节流，平滑突发
+6. **Tool description truncation** — MAX_TOOL_DESC=2000 chars, MAX_SCHEMA_DESC=600 chars
+7. **Input token safety** — estimates tokens from text content, rejects if over model limit
+8. **Messages sequence fix** — messages 以 assistant 结尾时自动 append `{"role":"user","content":"Continue."}`（GLM 拒绝 assistant 结尾序列）
 
 ### Feishu Channel
 

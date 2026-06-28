@@ -1,5 +1,58 @@
 # CHANGELOG
 
+## v0.4.0 (2026-06-28) — passthrough OpenAI 路径强制流式修空响应 + 突发 429 冷却治理
+
+### 概述
+本机 openclaw 模型链路 `openclaw → 40003 (passthrough) → ms_uni41001 (ms-gateway) → ModelScope GLM-5.2` 的两项关键修复：
+1. **修复空响应 bug**：openclaw 发非流式 `/v1/chat/completions` 请求时，passthrough proxy 原先直接透传 ModelScope 非流式响应，而 ModelScope 非流式返回 `choices:null / completion_tokens:0`（"delta bug"），导致 openclaw 拿到空回复。现已对 OpenAI 路径也强制 `stream=true` 上游、流式收集后合成真正的非流式 OpenAI 响应。
+2. **突发 429 治理**：ModelScope 的 429 主要是 `"Request rate increased too quickly"`（短时并发突发限速），而非日配额耗尽。新增 per-(variant,key) 突发冷却：burst 429 时标记该 slot 冷却 8s，轮询自动绕开；全局出站间隔 1.5→1.8s 平滑突发。
+
+### 背景（实测结论，修正 CLAUDE.md 旧描述）
+- `ms_uni41001` 已不是 LiteLLM，是 ~50MB Python 直连 ModelScope 的轻量网关（`/opt/cc-infra/proxy/ms-gateway`）。10 variants × 7 keys = 70 deployments，variant ID 全是 `ZHIPUAI/*-5.2` 大小写变体，每个 variant 独立 200/天 配额。
+- CLAUDE.md 里"41001→41002 双 LiteLLM 兜底"在本机不存在（41002 容器未起，ms-gateway 不依赖 DB）。
+- passthrough config 里 `glm5.2→glm5.1` 的注释"ModelScope dropped GLM-5.2"是过时错误信息——实测 GLM-5.2 和 GLM-5.1 都在 ModelScope 可用，链路实际打到的就是 GLM-5.2。模型名 `glm5.1_*` 仅为历史命名遗留。
+- ModelScope 限速头实测：`Model-Requests-Limit: 200`（每 variant/天）、`Requests-Limit: 2000`（账户级/天）、突发 429 与日配额无关。
+- openclaw 配置 `api: openai-completions` 直连 40003 `/v1/chat/completions`，不经 cc-proxy 的 Anthropic 转换。
+
+### 详细变更
+
+#### 1. `proxy/passthrough-proxy/gateway/stream.py` — 新增 `collect_stream_to_openai()`
+- 镜像已有 `collect_stream_to_anth` 的 SSE 解析逻辑，合成 **OpenAI** 非流式响应：`choices[0].message{role,content,tool_calls,reasoning_content}` + `usage` + `finish_reason`。
+- 对 `delta`/`tool_calls`/`choices` 为 `None` 的 chunk 做防御（ModelScope 流式 chunk 里这些字段常显式为 null）。
+
+#### 2. `proxy/passthrough-proxy/gateway/handlers.py` — OpenAI 路径强制流式
+- `_handle_chat_completions`：非流式请求设 `force_stream_for_nonstream=True`，`body["stream"]=True`，加 `stream_options.include_usage`。
+- 成功路径新增 `elif force_stream_for_nonstream:` 分支调用 `collect_stream_to_openai`（原先非流式直接 `resp.read()` 透传空响应）。
+- 导入 `collect_stream_to_openai`。
+
+#### 3. `proxy/passthrough-proxy/gateway/config.py` — per-(variant,key) 突发冷却
+- 新增 `BURST_COOLDOWN_S`（默认 8s，env 可调）、`_ms_cooldown` 表、`mark_ms_cooldown(v,k)`、`_ms_slot_cooled_down()`。
+- `_next_variant_key_pair` 返回前：若选中的 MS slot 处于冷却期，推进 round-robin 直到找到未冷却 slot（或扫遍整轮 70 slot）。
+
+#### 4. `proxy/passthrough-proxy/gateway/upstream.py` — burst 429 标记冷却
+- MS 429 处理：`cycle_reason="429_rate_limit"`（非 quota）时调用 `mark_ms_cooldown(start_variant_idx, current_key_idx)`。quota 耗尽型不冷却（冷却无意义，靠 key-cycling 解决）。
+- 导入 `mark_ms_cooldown`。
+
+#### 5. `docker-compose.yml` — 40003 env 调整
+- `MIN_OUTBOUND_INTERVAL_S`: 1.5 → **1.8**（平滑突发）。
+- 新增 `BURST_COOLDOWN_S: "8"`。
+
+### 不动的部分（按用户决策）
+- 不动 openclaw 配置（仍 `openai-completions` → 40003）。
+- 不删/不改其它容器（40001/40002/40005/40000/40006/41101-41105 全部保留）。
+- 不改 ms-gateway（已是纯直连，无 429 日志，工作正常）。
+
+### 验证（本机实测通过）
+- 非流式：`curl 40003 ... stream:false` → `content="OK"`, `usage` 正常（修复前为空）。
+- 流式：`stream:true` → 正常 SSE。
+- 连发 15 次非流式：15/15 成功，0 空响应、0 个 429。
+- `openclaw agent --agent main --message "回复两个字：你好"` → 真实回复"你好"。
+- metrics.jsonl：`force_stream_collect_success=True`、v×k 轮询正常推进、`finish_reason=stop`、`output_tokens` 正常。
+
+### 回滚
+- `git revert` + `cd /opt/cc-infra && docker compose up -d --build auth_to_api_40003`。仅影响 40003 单容器。
+
+
 ## v0.3.0 (2026-06-25) — 远程模型链路改为主备: openclaw → 40003 → 41001(默认) + 41002(兜底)，仅用 ModelScope GLM-5.2
 
 ### 概述
